@@ -78,7 +78,8 @@ func (s *Server) run() error {
 				}
 				worker := s.workers[rand.Intn(n)]
 				if err := s.assignTask(task, cmd, worker); err != nil {
-					return err
+					log.Printf("failed to assign task %s to worker %s, err= %v\n", task, worker, err)
+					continue
 				}
 				log.Printf("[%s] assigned to %s\n", task, worker)
 			}
@@ -322,16 +323,30 @@ func (s *Server) updateWorkersView(workers []string) error {
 			} else if cmd == "" {
 				continue
 			}
-			if err := s.createTask(task, cmd); err != nil {
-				return err
-			}
-			if err := s.removeAssignedTask(worker, task); err != nil {
-				return err
-			}
-			log.Printf("worker %s task %s reassined\n", workers, task)
+			s.moveAssignTaskBackToTasks(worker, task, cmd)
 		}
 	}
 	return nil
+}
+
+func (s *Server) moveAssignTaskBackToTasks(worker string, task string, cmd string) {
+	_, err := s.zk.Multi(
+		&zk.CreateRequest{Path: "/tasks/" + task, Data: []byte(cmd), Acl: zk.WorldACL(zk.PermAll)},
+		&zk.DeleteRequest{Path: "/assign/" + worker + "/" + task, Version: -1},
+	)
+	switch err {
+	case nil:
+		log.Printf("worker %s task %s is back to tasks pool\n", worker, task)
+	case zk.ErrNodeExists:
+		log.Println("task is already in the pool")
+	case zk.ErrNoNode:
+		log.Println("absent task not found")
+	case zk.ErrConnectionClosed:
+		log.Println("connection lost")
+		s.moveAssignTaskBackToTasks(worker, task, cmd)
+	default:
+		log.Printf("failed to move absent task from /assign to /tasks, err= %v", err)
+	}
 }
 
 func (s *Server) getWorkerTasks(worker string) ([]string, error) {
@@ -361,36 +376,6 @@ func (s *Server) getAssignedTask(worker string, task string) (string, error) {
 		return s.getAssignedTask(worker, task)
 	default:
 		return "", err
-	}
-}
-
-func (s *Server) removeAssignedTask(worker string, task string) error {
-	path := "/assign/" + worker + "/" + task
-	err := s.zk.Delete(path, -1)
-	switch err {
-	case nil:
-		return nil
-	case zk.ErrNoNode:
-		log.Printf("worker %s task %s not found\n", worker, task)
-		return nil
-	case zk.ErrConnectionClosed:
-		return s.removeAssignedTask(worker, task)
-	default:
-		return err
-	}
-}
-
-func (s *Server) createTask(name string, cmd string) error {
-	_, err := s.zk.Create("/tasks/"+name, []byte(cmd), 0, zk.WorldACL(zk.PermAll))
-	switch err {
-	case nil:
-		return nil
-	case zk.ErrNodeExists:
-		return nil
-	case zk.ErrConnectionClosed:
-		return s.createTask(name, cmd)
-	default:
-		return err
 	}
 }
 
@@ -436,26 +421,20 @@ func (s *Server) getTask(task string) (string, error) {
 	}
 }
 
-// todo atomically move task from /tasks to /assign/worker
 func (s *Server) assignTask(task string, cmd string, worker string) error {
-	_, err := s.zk.Create("/assign/"+worker+"/"+task, []byte(cmd), 0, zk.WorldACL(zk.PermAll))
+	_, err := s.zk.Multi(
+		&zk.CreateRequest{Path: "/assign/" + worker + "/" + task, Data: []byte(cmd), Acl: zk.WorldACL(zk.PermAll)},
+		&zk.DeleteRequest{Path: "/tasks/" + task, Version: -1},
+	)
 	switch err {
-	case nil, zk.ErrNodeExists:
-		return s.removeTask(task)
+	case nil:
+		return nil
+	case zk.ErrNodeExists:
+		return fmt.Errorf("task already assigned")
+	case zk.ErrNoNode:
+		return fmt.Errorf("task not found")
 	case zk.ErrConnectionClosed:
 		return s.assignTask(task, cmd, worker)
-	default:
-		return err
-	}
-}
-
-func (s *Server) removeTask(task string) error {
-	err := s.zk.Delete("/tasks/"+task, -1)
-	switch err {
-	case zk.ErrNoNode:
-		return nil
-	case zk.ErrConnectionClosed:
-		return s.removeTask(task)
 	default:
 		return err
 	}
@@ -474,26 +453,23 @@ func (s *Server) runTask(task string) {
 	time.Sleep(time.Duration(1+rand.Intn(10)) * time.Second)
 	log.Printf("[%s] done in %v", task, time.Since(startAt))
 
-	if err := s.setTaskStatus(task, "success"); err != nil {
-		log.Printf("task %s done, but update status failed, err= %v", task, err)
-		return
-	}
-	if err := s.removeAssignedTask(s.id, task); err != nil {
-		log.Printf("task %s status updated, but remove task failed, err= %v", task, err)
-		return
-	}
-	log.Printf("task %s done", task)
-}
-
-func (s *Server) setTaskStatus(task string, status string) error {
-	_, err := s.zk.Create("/status/"+task, []byte(status), 0, zk.WorldACL(zk.PermAll))
+SetTaskStatus:
+	_, err = s.zk.Multi(
+		&zk.CreateRequest{Path: "/status/" + task, Data: []byte(cmd), Acl: zk.WorldACL(zk.PermAll)},
+		&zk.DeleteRequest{Path: "/assign/" + s.id + "/" + task, Version: -1},
+	)
 	switch err {
+	case nil:
+		log.Printf("[%s] status updated\n", task)
 	case zk.ErrNodeExists:
-		return nil
+		log.Println("task status exists")
+	case zk.ErrNoNode:
+		log.Println("assign task not found")
 	case zk.ErrConnectionClosed:
-		return s.setTaskStatus(task, status)
+		log.Println("connection lost, retry...")
+		goto SetTaskStatus
 	default:
-		return err
+		log.Printf("failed to set task status, err= %v", err)
 	}
 }
 
